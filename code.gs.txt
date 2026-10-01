@@ -1,0 +1,412 @@
+var SHEET_NAME = 'Queue';
+var HISTORY_SHEET = 'History';
+var PROP = PropertiesService.getScriptProperties();
+var TICKET_PREFIX = 'A';
+var NOTIFY_AHEAD = 3; // แจ้งเตือนล่วงหน้าคนที่อยู่ลำดับที่ 3 ในแถวรอ (ตั้งเป็น 0 เพื่อปิด)
+
+// ⚠️ เปลี่ยนรหัสผ่านนี้ก่อน deploy จริง
+var STAFF_PIN = '1234';
+
+function checkStaffPin(pin) {
+  return String(pin) === String(STAFF_PIN);
+}
+
+// ---------- Web app entry points ----------
+function doGet(e) {
+  return HtmlService.createHtmlOutputFromFile('Index')
+    .setTitle('Tenko - ระบบเรียกคิว')
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1')
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
+
+// API สำหรับหน้าลูกค้าที่โฮสต์บน GitHub Pages
+function doPost(e) {
+  var out = null;
+  try {
+    var b = JSON.parse(e.postData.contents);
+    if (b.action === 'issue') out = { number: issueTicket(b.token) };
+    else if (b.action === 'status') out = getTicketStatus(b.number);
+    else if (b.action === 'state') out = getState();
+  } catch (err) {
+    out = { error: String(err) };
+  }
+  return ContentService.createTextOutput(JSON.stringify(out))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+// ---------- helpers ----------
+function getSheet_() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(SHEET_NAME);
+  if (!sheet) {
+    sheet = ss.insertSheet(SHEET_NAME);
+    sheet.appendRow(['Number', 'Status', 'IssuedAt', 'CalledAt', 'DoneAt', 'FcmToken']);
+    sheet.setFrozenRows(1);
+  } else if (!sheet.getRange(1, 6).getValue()) {
+    sheet.getRange(1, 6).setValue('FcmToken');
+  }
+  return sheet;
+}
+
+function getHistorySheet_() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(HISTORY_SHEET);
+  if (!sheet) {
+    sheet = ss.insertSheet(HISTORY_SHEET);
+    sheet.appendRow(['Date', 'Number', 'Status', 'IssuedAt', 'CalledAt', 'DoneAt', 'WaitMin', 'ServiceMin']);
+    sheet.setFrozenRows(1);
+  }
+  return sheet;
+}
+
+function getWebAppUrl() {
+  return ScriptApp.getService().getUrl();
+}
+
+// URL หน้าลูกค้าที่โฮสต์ (ใช้สร้าง QR บนจอแสดงผล)
+function getCustomerPageUrl() {
+  return PROP.getProperty('CUSTOMER_PAGE_URL') || '';
+}
+
+function isDate_(v) { return Object.prototype.toString.call(v) === '[object Date]' && !isNaN(v); }
+function minutes_(a, b) { return (isDate_(a) && isDate_(b)) ? Math.max(0, Math.round((b - a) / 6000) / 10) : ''; }
+function label_(n) { return TICKET_PREFIX + ('00' + n).slice(-3); }
+
+// ---------- FCM push ----------
+function getFcmAccessToken_() {
+  var cache = CacheService.getScriptCache();
+  var cached = cache.get('fcm_token');
+  if (cached) return cached;
+
+  var email = PROP.getProperty('FCM_CLIENT_EMAIL');
+  var key = (PROP.getProperty('FCM_PRIVATE_KEY') || '').replace(/\\n/g, '\n');
+  if (!email || !key) return null;
+
+  var now = Math.floor(Date.now() / 1000);
+  var enc = function (o) {
+    return Utilities.base64EncodeWebSafe(JSON.stringify(o)).replace(/=+$/, '');
+  };
+  var unsigned = enc({ alg: 'RS256', typ: 'JWT' }) + '.' + enc({
+    iss: email,
+    scope: 'https://www.googleapis.com/auth/firebase.messaging',
+    aud: 'https://oauth2.googleapis.com/token',
+    iat: now,
+    exp: now + 3600
+  });
+  var sig = Utilities.base64EncodeWebSafe(
+    Utilities.computeRsaSha256Signature(unsigned, key)).replace(/=+$/, '');
+
+  var res = UrlFetchApp.fetch('https://oauth2.googleapis.com/token', {
+    method: 'post',
+    payload: {
+      grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+      assertion: unsigned + '.' + sig
+    },
+    muteHttpExceptions: true
+  });
+  var tok = JSON.parse(res.getContentText()).access_token;
+  if (tok) cache.put('fcm_token', tok, 3000);
+  else console.error('FCM token error: ' + res.getContentText());
+  return tok || null;
+}
+
+function pushFcm_(token, title, body) {
+  if (!token) return;
+  try {
+    var access = getFcmAccessToken_();
+    if (!access) return;
+    var res = UrlFetchApp.fetch('https://fcm.googleapis.com/v1/projects/' +
+      PROP.getProperty('FCM_PROJECT_ID') + '/messages:send', {
+      method: 'post',
+      contentType: 'application/json',
+      headers: { Authorization: 'Bearer ' + access },
+      payload: JSON.stringify({ message: {
+        token: String(token),
+        notification: { title: title, body: body },
+        webpush: {
+          headers: { Urgency: 'high', TTL: '300' },
+          fcm_options: { link: PROP.getProperty('CUSTOMER_PAGE_URL') || '' }
+        }
+      } }),
+      muteHttpExceptions: true
+    });
+    if (res.getResponseCode() !== 200) console.error('FCM send error: ' + res.getContentText());
+  } catch (e) {
+    console.error('pushFcm_ failed: ' + e);
+  }
+}
+
+// รันฟังก์ชันนี้ 1 ครั้งจาก editor เพื่ออนุญาตสิทธิ์ และทดสอบว่าตั้งค่า Service account ถูกต้อง
+function testFcmAuth() {
+  var t = getFcmAccessToken_();
+  console.log(t ? '✅ ได้ access token แล้ว ตั้งค่าถูกต้อง' : '❌ ไม่ได้ token ดู Execution log / ตรวจ Script Properties');
+}
+
+// ---------- customer: take a ticket ----------
+function issueTicket(token) {
+  var lock = LockService.getScriptLock();
+  lock.waitLock(15000);
+  try {
+    var last = Number(PROP.getProperty('lastIssued') || '0');
+    var next = last + 1;
+    var sheet = getSheet_();
+    sheet.appendRow([next, 'waiting', new Date(), '', '', token || '']);
+    PROP.setProperty('lastIssued', String(next));
+    return next;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// ---------- shared state ----------
+function getState() {
+  var sheet = getSheet_();
+  var lastRow = sheet.getLastRow();
+  var waiting = [];
+  if (lastRow > 1) {
+    var data = sheet.getRange(2, 1, lastRow - 1, 2).getValues();
+    for (var i = 0; i < data.length; i++) {
+      if (data[i][1] === 'waiting') waiting.push(Number(data[i][0]));
+    }
+    waiting.sort(function (a, b) { return a - b; });
+  }
+  var history = [];
+  try { history = JSON.parse(PROP.getProperty('history') || '[]'); } catch (e) {}
+  return {
+    currentCalling: Number(PROP.getProperty('currentCalling') || '0'),
+    recallToken: Number(PROP.getProperty('recallToken') || '0'),
+    history: history,
+    waiting: waiting,
+    lastResetTime: Number(PROP.getProperty('lastResetTime') || '0')
+  };
+}
+
+function getTicketStatus(number) {
+  var sheet = getSheet_();
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) return null;
+  var data = sheet.getRange(2, 1, lastRow - 1, 3).getValues();
+  for (var i = 0; i < data.length; i++) {
+    if (Number(data[i][0]) === Number(number)) {
+      return { number: Number(number), status: data[i][1], issuedAt: data[i][2] ? data[i][2].getTime() : null };
+    }
+  }
+  return null;
+}
+
+// ---------- staff actions ----------
+function callNext() {
+  var lock = LockService.getScriptLock();
+  lock.waitLock(15000);
+  var num = null, pushTo = null, aheadToken = null, aheadNum = null;
+  try {
+    var currentNum = Number(PROP.getProperty('currentCalling') || '0');
+    var sheet = getSheet_();
+    var lastRow = sheet.getLastRow();
+    if (currentNum && lastRow > 1) {
+      var d0 = sheet.getRange(2, 1, lastRow - 1, 1).getValues();
+      for (var k = 0; k < d0.length; k++) {
+        if (Number(d0[k][0]) === currentNum) {
+          sheet.getRange(k + 2, 2).setValue('done');
+          sheet.getRange(k + 2, 5).setValue(new Date());
+          sheet.getRange(k + 2, 6).clearContent(); // ลบ token ลูกค้าที่ให้บริการเสร็จแล้ว
+          break;
+        }
+      }
+    }
+
+    if (lastRow < 2) return null;
+    var data = sheet.getRange(2, 1, lastRow - 1, 6).getValues();
+    var rowIndex = -1;
+    for (var i = 0; i < data.length; i++) {
+      if (data[i][1] === 'waiting') { rowIndex = i; num = Number(data[i][0]); break; }
+    }
+    if (rowIndex === -1) return null;
+    sheet.getRange(rowIndex + 2, 2).setValue('called');
+    sheet.getRange(rowIndex + 2, 4).setValue(new Date());
+    pushTo = data[rowIndex][5];
+
+    if (NOTIFY_AHEAD > 0) {
+      var rest = data.filter(function (r, idx) { return idx > rowIndex && r[1] === 'waiting'; });
+      if (rest[NOTIFY_AHEAD - 1]) {
+        aheadToken = rest[NOTIFY_AHEAD - 1][5];
+        aheadNum = Number(rest[NOTIFY_AHEAD - 1][0]);
+      }
+    }
+
+    var history = [];
+    try { history = JSON.parse(PROP.getProperty('history') || '[]'); } catch (e) {}
+    history = [num].concat(history.filter(function (x) { return x !== num; })).slice(0, 5);
+
+    PROP.setProperty('history', JSON.stringify(history));
+    PROP.setProperty('currentCalling', String(num));
+    PROP.setProperty('recallToken', '0');
+  } finally {
+    lock.releaseLock();
+  }
+
+  // ส่งแจ้งเตือนหลังปล่อย lock เพื่อให้ปุ่มตอบสนองเร็ว
+  if (num) {
+    pushFcm_(pushTo, '🔔 ถึงคิวของคุณแล้ว', 'คิว ' + label_(num) + ' กรุณาไปที่เคาน์เตอร์บริการ');
+    if (aheadToken) pushFcm_(aheadToken, 'ใกล้ถึงคิวคุณแล้ว', 'อีก ' + NOTIFY_AHEAD + ' คิวจะถึงคิว ' + label_(aheadNum));
+  }
+  return num;
+}
+
+function recallCurrent() {
+  var token = Number(PROP.getProperty('recallToken') || '0') + 1;
+  PROP.setProperty('recallToken', String(token));
+  var cur = Number(PROP.getProperty('currentCalling') || '0');
+  if (cur) {
+    var sheet = getSheet_(), last = sheet.getLastRow();
+    if (last > 1) {
+      var d = sheet.getRange(2, 1, last - 1, 6).getValues();
+      for (var i = 0; i < d.length; i++) {
+        if (Number(d[i][0]) === cur) {
+          pushFcm_(d[i][5], '🔔 เรียกซ้ำ', 'คิว ' + label_(cur) + ' กรุณาไปที่เคาน์เตอร์บริการ');
+          break;
+        }
+      }
+    }
+  }
+  return cur;
+}
+
+// ---------- ARCHIVE: เก็บข้อมูลลงชีต History ก่อนล้างคิว ----------
+function archiveQueue_() {
+  var sheet = getSheet_();
+  var last = sheet.getLastRow();
+  if (last < 2) return 0;
+  var tz = Session.getScriptTimeZone();
+  var rows = sheet.getRange(2, 1, last - 1, 5).getValues(); // ไม่เก็บ FcmToken ลง History
+  var out = [];
+  rows.forEach(function (r) {
+    if (r[0] === '' || !isDate_(r[2])) return;
+    var status = r[1] === 'waiting' ? 'cancelled' : 'done';
+    out.push([Utilities.formatDate(r[2], tz, 'yyyy-MM-dd'), Number(r[0]), status,
+      r[2], r[3], r[4], minutes_(r[2], r[3]), minutes_(r[3], r[4])]);
+  });
+  if (out.length) {
+    var h = getHistorySheet_();
+    h.getRange(h.getLastRow() + 1, 1, out.length, 8).setValues(out);
+  }
+  return out.length;
+}
+
+function resetAll_() {
+  archiveQueue_();
+  var sheet = getSheet_();
+  var lastRow = sheet.getLastRow();
+  if (lastRow > 1) sheet.getRange(2, 1, lastRow - 1, 6).clearContent();
+  PROP.setProperty('lastIssued', '0');
+  PROP.setProperty('currentCalling', '0');
+  PROP.setProperty('recallToken', '0');
+  PROP.setProperty('history', '[]');
+  PROP.setProperty('lastResetTime', String(Date.now()));
+}
+
+function resetAll() {
+  var lock = LockService.getScriptLock();
+  lock.waitLock(15000);
+  try { resetAll_(); } finally { lock.releaseLock(); }
+}
+
+function checkAndResetAtMidnight() {
+  var lock = LockService.getScriptLock();
+  lock.waitLock(15000);
+  try {
+    var today = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd');
+    if (PROP.getProperty('lastResetDate') !== today) {
+      resetAll_();
+      PROP.setProperty('lastResetDate', today);
+    }
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// รันฟังก์ชันนี้ 1 ครั้งจาก editor เพื่อให้ระบบเก็บข้อมูลตอนเที่ยงคืนเอง แม้ไม่มีใครเปิดหน้าเว็บ
+function setupDailyTrigger() {
+  ScriptApp.getProjectTriggers().forEach(function (t) {
+    if (t.getHandlerFunction() === 'checkAndResetAtMidnight') ScriptApp.deleteTrigger(t);
+  });
+  ScriptApp.newTrigger('checkAndResetAtMidnight').timeBased().atHour(0).nearMinute(5).everyDays(1).create();
+}
+
+// ---------- DASHBOARD ----------
+function getDashboardData(pin, days) {
+  if (!checkStaffPin(pin)) throw new Error('PIN ไม่ถูกต้อง');
+  days = Math.max(1, Math.min(365, Number(days) || 7));
+  var tz = Session.getScriptTimeZone();
+  var cutoff = Utilities.formatDate(new Date(Date.now() - (days - 1) * 86400000), tz, 'yyyy-MM-dd');
+
+  var recs = [];
+  var hs = getHistorySheet_(), hl = hs.getLastRow();
+  if (hl > 1) hs.getRange(2, 1, hl - 1, 8).getValues().forEach(function (r) {
+    if (isDate_(r[3])) recs.push({ s: r[2], i: r[3], w: r[6] === '' ? null : Number(r[6]), v: r[7] === '' ? null : Number(r[7]) });
+  });
+  var qs = getSheet_(), ql = qs.getLastRow();
+  if (ql > 1) qs.getRange(2, 1, ql - 1, 5).getValues().forEach(function (r) {
+    if (!isDate_(r[2])) return;
+    var w = minutes_(r[2], r[3]), v = minutes_(r[3], r[4]);
+    recs.push({ s: r[1] === 'waiting' ? 'waiting' : 'done', i: r[2], w: w === '' ? null : w, v: v === '' ? null : v });
+  });
+
+  var byHour = [], waitSum = [], waitCnt = [], byWd = [0, 0, 0, 0, 0, 0, 0], heat = [], perDay = {};
+  for (var h = 0; h < 24; h++) { byHour.push(0); waitSum.push(0); waitCnt.push(0); }
+  for (var d = 0; d < 7; d++) { heat.push(byHour.map(function () { return 0; })); }
+  var total = 0, served = 0, cancelled = 0, wSum = 0, wN = 0, vSum = 0, vN = 0;
+
+  recs.forEach(function (r) {
+    var ds = Utilities.formatDate(r.i, tz, 'yyyy-MM-dd');
+    if (ds < cutoff) return;
+    var hr = Number(Utilities.formatDate(r.i, tz, 'H'));
+    var wd = Number(Utilities.formatDate(r.i, tz, 'u')) - 1;
+    total++;
+    byHour[hr]++; byWd[wd]++; heat[wd][hr]++;
+    perDay[ds] = (perDay[ds] || 0) + 1;
+    if (r.s === 'done') served++;
+    if (r.s === 'cancelled') cancelled++;
+    if (r.w !== null) { wSum += r.w; wN++; waitSum[hr] += r.w; waitCnt[hr]++; }
+    if (r.v !== null) { vSum += r.v; vN++; }
+  });
+
+  var labels = [], values = [];
+  for (var n = days - 1; n >= 0; n--) {
+    var k = Utilities.formatDate(new Date(Date.now() - n * 86400000), tz, 'yyyy-MM-dd');
+    labels.push(k.slice(5)); values.push(perDay[k] || 0);
+  }
+  var peak = 0;
+  for (var p = 1; p < 24; p++) if (byHour[p] > byHour[peak]) peak = p;
+  var r1 = function (x) { return Math.round(x * 10) / 10; };
+
+  return {
+    days: days, total: total, served: served, cancelled: cancelled,
+    avgWait: wN ? r1(wSum / wN) : null,
+    avgService: vN ? r1(vSum / vN) : null,
+    peakHour: total ? peak : null, peakCount: total ? byHour[peak] : 0,
+    byHour: byHour,
+    waitByHour: waitSum.map(function (s, i) { return waitCnt[i] ? r1(s / waitCnt[i]) : 0; }),
+    byWeekday: byWd, heat: heat,
+    trend: { labels: labels, values: values }
+  };
+}
+
+// ---------- shop settings ----------
+function setShopSettings(name, subtitle) {
+  PROP.setProperty('shopName', String(name || 'Tenko'));
+  PROP.setProperty('shopSubtitle', String(subtitle || 'ระบบเรียกคิว'));
+}
+
+function getShopSettings() {
+  return {
+    shopName: PROP.getProperty('shopName') || 'Tenko',
+    shopSubtitle: PROP.getProperty('shopSubtitle') || 'ระบบเรียกคิว'
+  };
+}
+function testProps() {
+  console.log('project: ' + PROP.getProperty('FCM_PROJECT_ID'));
+  console.log('email: ' + PROP.getProperty('FCM_CLIENT_EMAIL'));
+  console.log('key length: ' + (PROP.getProperty('FCM_PRIVATE_KEY') || '').length);
+}
+function ping() { console.log('ok'); }
