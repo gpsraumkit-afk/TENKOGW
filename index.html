@@ -41,10 +41,15 @@ select{font:700 14px 'Plus Jakarta Sans';padding:8px;border-radius:10px;border:1
 </head>
 <body>
 <div id="root"></div>
+<div id="cfg" hidden data-role="<?= role ?>" data-base="<?= baseUrl ?>"></div>
 <script>
-var ROLE = <?!= JSON.stringify(role) ?>;
-var BASE = <?!= JSON.stringify(baseUrl) ?>;
 var root = document.getElementById('root');
+var cfg = document.getElementById('cfg');
+var ROLE = cfg.getAttribute('data-role') || '';
+var BASE = cfg.getAttribute('data-base') || '';
+var RAW = ROLE.indexOf('<?') >= 0 || BASE.indexOf('<?') >= 0;
+function fail(t) { root.innerHTML = '<main><div class="card" style="text-align:left"><b>เปิดหน้านี้ไม่ได้</b><div class="muted" style="margin-top:10px;line-height:1.7">' + t + '</div></div></main>'; }
+window.onerror = function (m) { fail('JavaScript error: ' + m); };
 var PIN = '';
 var label = function (n) { return 'A' + ('00' + n).slice(-3); };
 function run(fn) {
@@ -180,13 +185,22 @@ function dashboard() {
 }
 
 /* ---------- เริ่มทำงาน ---------- */
-try {
-  if (ROLE === 'caller') start('เจ้าหน้าที่', caller);
-  else if (ROLE === 'display') display();
-  else if (ROLE === 'dashboard') start('แดชบอร์ด', dashboard);
-  else menu();
-} catch (e) {
-  root.innerHTML = '<main><div class="card">เกิดข้อผิดพลาด: ' + msg(e) + '</div></main>';
+function boot() {
+  try {
+    if (ROLE === 'caller') start('เจ้าหน้าที่', caller);
+    else if (ROLE === 'display') display();
+    else if (ROLE === 'dashboard') start('แดชบอร์ด', dashboard);
+    else menu();
+  } catch (e) { fail(msg(e)); }
+}
+if (typeof google === 'undefined' || !google.script || !google.script.run) {
+  fail('ไฟล์นี้ต้องเปิดจาก URL ของ Apps Script (script.google.com/macros/s/.../exec?role=display) ไม่ใช่จาก GitHub Pages หรือเปิดเป็นไฟล์ในเครื่อง');
+} else if (RAW) {
+  fail('Apps Script ยังไม่ได้ประมวลผลเทมเพลต แปลว่า <code>doGet</code> ที่ deploy อยู่ยังเป็นเวอร์ชันเก่า วาง <code>Code.gs</code> ใหม่ แล้ว Deploy → Manage deployments → Version: New version');
+} else if (!ROLE && google.script.url && google.script.url.getLocation) {
+  google.script.url.getLocation(function (loc) { ROLE = (loc && loc.parameter && loc.parameter.role) || ''; boot(); });
+} else {
+  boot();
 }
 </script>
 </body>
