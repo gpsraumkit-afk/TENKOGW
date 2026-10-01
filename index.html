@@ -32,6 +32,9 @@ main{max-width:520px;margin:0 auto;padding:24px 16px 48px;text-align:center}
 .pop div{background:var(--ink);color:#fff;border:2px solid rgba(255,229,0,.4);border-radius:24px;padding:40px 32px;text-align:center;max-width:90%}
 .pop .n{font:500 64px 'DM Mono',monospace;color:var(--gold);margin:12px 0}
 .pop button{background:var(--gold);border:0;border-radius:10px;padding:12px 28px;font:800 14px 'Plus Jakarta Sans';cursor:pointer;margin-top:18px}
+.foot{margin-top:32px;display:flex;gap:10px;justify-content:center;flex-wrap:wrap}
+.foot a{color:#444b53;font-size:12px;font-weight:700;text-decoration:none;padding:9px 14px;border:1px solid #dfe3e8;border-radius:999px;background:#fff}
+.foot a:hover{border-color:var(--ink)}
 @media (prefers-reduced-motion:reduce){.called{animation:none}}
 </style>
 </head>
@@ -40,9 +43,6 @@ main{max-width:520px;margin:0 auto;padding:24px 16px 48px;text-align:center}
 <main id="app"></main>
 
 <script type="module">
-import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js';
-import { getMessaging, getToken } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-messaging.js';
-
 /* ===== ตั้งค่า 3 อย่างนี้ ===== */
 const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbwFkcN0hpZWLH3rm9RMTk0sXgLPRiKQcZi_Z7o6oPSh4lpbYvKp6xpIOxtrXHrWHqoB/exec';
 const FIREBASE_CONFIG = {
@@ -83,6 +83,9 @@ async function getPushToken(){
     if (!pushSupported || (isIOS && !isStandalone) || !VAPID_KEY) { pushState = 'unavailable'; return null; }
     const perm = await Notification.requestPermission();
     if (perm !== 'granted') { pushState = 'denied'; return null; }
+    const base = 'https://www.gstatic.com/firebasejs/10.12.2/';
+    const { initializeApp } = await import(base + 'firebase-app.js');
+    const { getMessaging, getToken } = await import(base + 'firebase-messaging.js');
     const reg = await navigator.serviceWorker.register('firebase-messaging-sw.js');
     await navigator.serviceWorker.ready;
     const token = await getToken(getMessaging(initializeApp(FIREBASE_CONFIG)), { vapidKey: VAPID_KEY, serviceWorkerRegistration: reg });
@@ -121,10 +124,20 @@ function pushNote(){
   if (pushState === 'denied') return '<div class="note">คุณปิดการแจ้งเตือนไว้ เปิดได้ที่การตั้งค่าเบราว์เซอร์ ตอนนี้ให้เปิดหน้านี้ค้างไว้เพื่อรับเสียงเตือน</div>';
   return '';
 }
+// ลิงก์ไปหน้าที่อยู่ใน Apps Script: เจ้าหน้าที่และแดชบอร์ดจะถามรหัส PIN ก่อนเข้า
+const SHOW_STAFF_LINKS = true;   // ตั้งเป็น false เพื่อซ่อนจากลูกค้า (แล้วใช้บุ๊กมาร์กแทน)
+function footer(){
+  if (!SHOW_STAFF_LINKS) return '';
+  const u = APPS_SCRIPT_URL;
+  return '<div class="foot">' +
+    '<a href="' + u + '?role=caller">🔒 เจ้าหน้าที่</a>' +
+    '<a href="' + u + '?role=display">จอแสดงผล</a>' +
+    '<a href="' + u + '?role=dashboard">🔒 แดชบอร์ด</a></div>';
+}
 function render(){
   if (myNumber == null){
     app.innerHTML = '<div style="min-height:58vh;display:flex;flex-direction:column;justify-content:center"><div class="muted" style="margin-bottom:20px">แตะปุ่มสีเหลืองเพื่อรับคิว</div>' +
-      '<button class="btn" id="take"' + (busy ? ' disabled' : '') + '>🎫<br>' + (busy ? 'กำลังออกบัตรคิว...' : 'รับบัตรคิว') + '</button></div>' + iosNote();
+      '<button class="btn" id="take"' + (busy ? ' disabled' : '') + '>🎫<br>' + (busy ? 'กำลังออกบัตรคิว...' : 'รับบัตรคิว') + '</button></div>' + iosNote() + footer();
     document.getElementById('take').onclick = take;
     return;
   }
@@ -135,7 +148,7 @@ function render(){
   if (s === 'done') h += '<div class="st done">✓ ให้บริการเรียบร้อย</div><button class="btn2" id="again">รับบัตรคิวใหม่</button>';
   else if (s === 'called') h += '<div class="st called">🔔 ถึงคิวของคุณแล้ว!</div><div class="muted">กรุณาไปที่เคาน์เตอร์บริการ</div>';
   else h += '<div class="st">⏳ กำลังรอคิว...</div><div class="muted">ระบบจะแจ้งเตือนเมื่อถึงคิว</div>' + pushNote() + iosNote();
-  app.innerHTML = h;
+  app.innerHTML = h + footer();
   const a = document.getElementById('again');
   if (a) a.onclick = () => { store.clear(); myNumber = null; myTicket = null; oldStatus = null; render(); };
 }
