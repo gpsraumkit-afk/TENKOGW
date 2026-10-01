@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>RUAMKIT - รับคิว</title>
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="icon-192.png">
+<meta name="theme-color" content="#111315">
+<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@500;700;800&family=DM+Mono:wght@500&display=swap" rel="stylesheet">
+<style>
+:root{--ink:#111315;--gold:#ffe500;--muted:#69717c;--line:#e4e8ed;--green:#19a974}
+*{box-sizing:border-box}
+html,body{margin:0;min-height:100%;background:#f4f6f8;color:var(--ink);font-family:'Plus Jakarta Sans',sans-serif}
+.bar{display:flex;align-items:center;gap:12px;padding:14px 20px;padding-top:calc(14px + env(safe-area-inset-top,0px));background:#fff;border-bottom:1px solid var(--line)}
+.bar img{width:42px;height:42px;border-radius:12px;object-fit:cover}
+.bar b{letter-spacing:.08em;font-size:17px}.bar small{display:block;font-size:10px;color:var(--muted);letter-spacing:.08em}
+main{max-width:520px;margin:0 auto;padding:24px 16px 48px;text-align:center}
+.muted{color:var(--muted);font-size:14px}
+.btn{width:100%;border:0;border-radius:24px;font:800 24px 'Plus Jakarta Sans';cursor:pointer;padding:48px 24px;background:var(--gold);color:var(--ink);box-shadow:0 20px 50px rgba(255,229,0,.4)}
+.btn:disabled{opacity:.5}
+.btn2{border:1px solid #dfe3e8;background:#fff;border-radius:14px;padding:14px 20px;font:800 14px 'Plus Jakarta Sans';cursor:pointer;width:100%;margin-top:16px}
+.stub{background:#fff;border:1px solid var(--line);border-radius:20px;overflow:hidden;margin:20px 0;box-shadow:0 12px 30px rgba(17,19,21,.08)}
+.stub .top{background:var(--ink);color:#fff;padding:12px 18px;display:flex;justify-content:space-between;font-size:11px}
+.stub .num{font:500 92px 'DM Mono',monospace;margin:18px 0 10px}
+.stub .bot{border-top:2px dashed #cbd5df;padding:12px 18px;display:flex;justify-content:space-between;font:11px 'DM Mono',monospace;color:var(--muted)}
+.st{font-size:17px;font-weight:800;margin:20px 0 6px}
+.called{color:#b38f00;animation:blink 1s ease infinite}.done{color:var(--green)}
+@keyframes blink{50%{opacity:.55}}
+.note{background:#fff8c2;border:1px solid #e6d44d;border-radius:14px;padding:14px 16px;font-size:13px;line-height:1.7;text-align:left;margin-top:16px}
+.pop{position:fixed;inset:0;background:rgba(0,0,0,.7);display:flex;align-items:center;justify-content:center;z-index:99}
+.pop div{background:var(--ink);color:#fff;border:2px solid rgba(255,229,0,.4);border-radius:24px;padding:40px 32px;text-align:center;max-width:90%}
+.pop .n{font:500 64px 'DM Mono',monospace;color:var(--gold);margin:12px 0}
+.pop button{background:var(--gold);border:0;border-radius:10px;padding:12px 28px;font:800 14px 'Plus Jakarta Sans';cursor:pointer;margin-top:18px}
+@media (prefers-reduced-motion:reduce){.called{animation:none}}
+</style>
+</head>
+<body>
+<div class="bar"><img src="logo.jpg" alt="" onerror="this.style.display='none'"><div><b>RUAMKIT</b><small>SMART QUEUE SYSTEM</small></div></div>
+<main id="app"></main>
+
+<script type="module">
+import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js';
+import { getMessaging, getToken } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-messaging.js';
+
+/* ===== ตั้งค่า 3 อย่างนี้ ===== */
+const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/XXXXXXXX/exec';
+const FIREBASE_CONFIG = {
+  apiKey: "AIzaSyAdrUOwrA-TfSE5-bYcq4l6aCjxpOXkSZ8",
+  authDomain: "ruamkit-queue.firebaseapp.com",
+  projectId: "ruamkit-queue",
+  storageBucket: "ruamkit-queue.firebasestorage.app",
+  messagingSenderId: "887103361405",
+  appId: "1:887103361405:web:8e37efa98ef8358df2bc14"
+};
+const VAPID_KEY = BAqdj6GXv_vKZTikfqFTbBx8JQjuvgn39-YKsn1iPAaYedEBNaTVNenTQTJcXm2J9KlGsxKEzbHYnXOA4yZoy3M;
+/* ============================= */
+
+const PREFIX = 'A', POLL_MS = 2500, KEY = 'ruamkit_ticket';
+const app = document.getElementById('app');
+let myNumber = null, myTicket = null, oldStatus = null, busy = false, pushState = 'unknown';
+
+const ua = navigator.userAgent;
+const isIOS = /iPhone|iPad|iPod/.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+const isStandalone = window.matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+const pushSupported = 'Notification' in window && 'serviceWorker' in navigator && 'PushManager' in window;
+
+const label = n => PREFIX + String(n).padStart(3, '0');
+const store = {
+  get(){ try { return JSON.parse(localStorage.getItem(KEY) || 'null'); } catch(e){ return null; } },
+  set(v){ try { localStorage.setItem(KEY, JSON.stringify(v)); } catch(e){} },
+  clear(){ try { localStorage.removeItem(KEY); } catch(e){} }
+};
+
+async function api(body){
+  const r = await fetch(APPS_SCRIPT_URL, { method:'POST', body: JSON.stringify(body) }); // ไม่ตั้ง Content-Type เพื่อเลี่ยง preflight
+  return r.json();
+}
+
+/* ---------- Push (FCM) ---------- */
+async function getPushToken(){
+  try {
+    if (!pushSupported || (isIOS && !isStandalone) || !VAPID_KEY) { pushState = 'unavailable'; return null; }
+    const perm = await Notification.requestPermission();
+    if (perm !== 'granted') { pushState = 'denied'; return null; }
+    const reg = await navigator.serviceWorker.register('firebase-messaging-sw.js');
+    await navigator.serviceWorker.ready;
+    const token = await getToken(getMessaging(initializeApp(FIREBASE_CONFIG)), { vapidKey: VAPID_KEY, serviceWorkerRegistration: reg });
+    pushState = token ? 'on' : 'unavailable';
+    return token || null;
+  } catch(e){ pushState = 'unavailable'; return null; }
+}
+
+/* ---------- แจ้งเตือนเมื่อเปิดหน้าอยู่ (fallback) ---------- */
+function alertCalled(){
+  if (navigator.vibrate) navigator.vibrate([100,50,100,50,200]);
+  try {
+    const c = new (window.AudioContext || window.webkitAudioContext)();
+    for (let i = 0; i < 3; i++){
+      const o = c.createOscillator(), g = c.createGain(), t = c.currentTime + i * .4;
+      o.frequency.value = 1200; g.gain.setValueAtTime(.3, t); g.gain.exponentialRampToValueAtTime(.01, t + .35);
+      o.connect(g); g.connect(c.destination); o.start(t); o.stop(t + .4);
+    }
+  } catch(e){}
+  const p = document.createElement('div');
+  p.className = 'pop';
+  p.innerHTML = '<div><div>ถึงคิวของคุณแล้ว</div><div class="n">' + label(myNumber) + '</div><div>กรุณาไปที่เคาน์เตอร์บริการ</div><button>ปิด</button></div>';
+  p.querySelector('button').onclick = () => p.remove();
+  document.body.appendChild(p);
+  setTimeout(() => p.remove(), 10000);
+}
+
+/* ---------- UI ---------- */
+function iosNote(){
+  return (isIOS && !isStandalone)
+    ? '<div class="note"><b>ต้องการแจ้งเตือนตอนปิดหน้าจอ?</b><br>แตะปุ่มแชร์ (สี่เหลี่ยมมีลูกศร) ใน Safari เลือก <b>เพิ่มลงในหน้าจอโฮม</b> แล้วเปิดจากไอคอนนั้น ต้องใช้ iOS 16.4 ขึ้นไป หากไม่ทำ ระบบจะแจ้งเตือนเฉพาะตอนเปิดหน้านี้ค้างไว้</div>'
+    : '';
+}
+function pushNote(){
+  if (pushState === 'on') return '<div class="muted" style="margin-top:14px">🔔 เปิดแจ้งเตือนแล้ว จะเด้งแม้ปิดหน้าจอ</div>';
+  if (pushState === 'denied') return '<div class="note">คุณปิดการแจ้งเตือนไว้ เปิดได้ที่การตั้งค่าเบราว์เซอร์ ตอนนี้ให้เปิดหน้านี้ค้างไว้เพื่อรับเสียงเตือน</div>';
+  return '';
+}
+function render(){
+  if (myNumber == null){
+    app.innerHTML = '<div style="min-height:58vh;display:flex;flex-direction:column;justify-content:center"><div class="muted" style="margin-bottom:20px">แตะปุ่มสีเหลืองเพื่อรับคิว</div>' +
+      '<button class="btn" id="take"' + (busy ? ' disabled' : '') + '>🎫<br>' + (busy ? 'กำลังออกบัตรคิว...' : 'รับบัตรคิว') + '</button></div>' + iosNote();
+    document.getElementById('take').onclick = take;
+    return;
+  }
+  const s = myTicket ? myTicket.status : 'waiting';
+  const d = myTicket && myTicket.issuedAt ? new Date(myTicket.issuedAt) : new Date();
+  const hm = String(d.getHours()).padStart(2,'0') + ':' + String(d.getMinutes()).padStart(2,'0');
+  let h = '<div class="stub"><div class="top"><span>RUAMKIT DIGITAL TICKET</span><span>●</span></div><div class="muted" style="margin-top:18px">หมายเลขของคุณ</div><div class="num">' + label(myNumber) + '</div><div class="bot"><span>' + hm + ' น.</span><span>COUNTER 01</span></div></div>';
+  if (s === 'done') h += '<div class="st done">✓ ให้บริการเรียบร้อย</div><button class="btn2" id="again">รับบัตรคิวใหม่</button>';
+  else if (s === 'called') h += '<div class="st called">🔔 ถึงคิวของคุณแล้ว!</div><div class="muted">กรุณาไปที่เคาน์เตอร์บริการ</div>';
+  else h += '<div class="st">⏳ กำลังรอคิว...</div><div class="muted">ระบบจะแจ้งเตือนเมื่อถึงคิว</div>' + pushNote() + iosNote();
+  app.innerHTML = h;
+  const a = document.getElementById('again');
+  if (a) a.onclick = () => { store.clear(); myNumber = null; myTicket = null; oldStatus = null; render(); };
+}
+
+async function take(){
+  if (busy) return;
+  busy = true; render();
+  try {
+    const token = await getPushToken();               // ต้องเรียกจากการแตะของผู้ใช้
+    const res = await api({ action:'issue', token });
+    myNumber = res.number; oldStatus = null;
+    store.set({ number: myNumber, issuedAt: Date.now() });
+  } catch(e){ alert('เกิดข้อผิดพลาด กรุณาลองใหม่'); }
+  busy = false; render();
+}
+
+async function poll(){
+  try {
+    if (myNumber != null){
+      const saved = store.get();
+      const st = await api({ action:'state' });
+      if (saved && st.lastResetTime > saved.issuedAt){        // ระบบรีเซ็ตคิวแล้ว
+        store.clear(); myNumber = null; myTicket = null; oldStatus = null; render(); return;
+      }
+      const t = await api({ action:'status', number: myNumber });
+      if (t){
+        if (t.status === 'called' && oldStatus !== 'called') alertCalled();
+        oldStatus = t.status;
+      }
+      myTicket = t;
+    }
+    render();
+  } catch(e){}
+}
+
+const saved = store.get();
+if (saved && saved.number) myNumber = saved.number;
+render(); poll(); setInterval(poll, POLL_MS);
+</script>
+</body>
+</html>
